@@ -1,0 +1,24 @@
+{
+	"OutputFiles": [
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\Module.EasytimeSplatRuntime.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\CPUSorting.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\EasytimeSplatExternalContentLibrary.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\EasytimeSplatRuntimeModule.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\FourCgsSplatActor.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\FourCgsSplatAsset.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\Logging.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\Splat4DActor.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\Splat4DComponent.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\Splat4DSequenceActor.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\SplatAsset.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\SplatComponent.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\SplatOptimization.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\SplatBuffers.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\SplatInterpolationCache.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\SplatRenderExtension.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\SplatRendering.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\SplatSceneProxy.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\SplatSceneViewExtension.cpp.obj",
+		"..\\..\\..\\x64\\UnrealGame\\Development\\EasytimeSplatRuntime\\SplatShaders.cpp.obj"
+	]
+}
