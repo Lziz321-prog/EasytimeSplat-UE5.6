@@ -1,0 +1,100 @@
+﻿/*
+  Copyright (c) 2025 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+/**
+ * Required headers:
+ * - constants.hlsl
+ */
+
+/**
+ * Colors a single fragment of a splat.
+ *
+ * @param sig_div_sqrt_2 - The distance to the center of the splat, in 蟽's, over
+ * sqrt(2).
+ * @param in_color - The splat's base color.
+ * @param out_color - Fragment color.
+ */
+void main(in float2 sig_div_sqrt_2 : DELTA_STD_DEVS,
+          in nointerpolation float4 in_color : COLOR,
+#if AFTER_TONEMAP
+          in float4 sv_position : SV_Position,
+#endif
+          out float4 out_color : SV_Target0) {
+  /**
+	 * Find the square of the distance from the center of the splat, in standard
+	 * deviations (蟽):
+	 *
+	 * r     = sqrt((x - 渭_x)^2 + (y - 渭_y)^2)
+	 * r_蟽   = sqrt(  螖_蟽x^2    +    螖_蟽y^2  )
+	 * r_蟽^2 =        螖_蟽x^2    +    螖_蟽y^2
+	 *
+	 * This is equivalent to a dot product of 螖_蟽 with itself:
+	 *
+	 * r_蟽^2 =     (螖_蟽x, 螖_蟽y) 鈰?(螖_蟽x, 螖_蟽y)
+	 *
+	 * Note: This is r_蟽^2 / 2, as it moves a division from here to earlier.
+	 */
+  float sig_sq_div_2 = dot(sig_div_sqrt_2, sig_div_sqrt_2);
+
+  /**
+	 * The Gaussian function (as used here) is of the form:
+	 *
+	 * g(x, y) = exp(-1/2 * ((x - x_0)^2 / 蟽_x^2 + (y - y_0) / 蟽_x^2))
+	 *
+	 * @see https://en.wikipedia.org/wiki/Gaussian_function
+	 *
+	 * Given *螖_蟽*, a vector representing the distance from the center of the
+	 * splat in standard deviations, we can rewrite the Gaussian function as:
+	 *
+	 * g(x, y) = exp(-1/2 * (螖_蟽x^2 + 螖_蟽y^2))
+	 *
+	 * Where:
+	 *   螖_蟽x = (x - x_0) / 蟽_x
+	 *   螖_蟽y = (y - y_0) / 蟽_y
+	 *
+	 * From here, we can again rewrite the Gaussian function to the following:
+	 *
+	 * g(x, y) = exp(-r_蟽^2 / 2)
+	 *
+	 * Where:
+	 *   r_蟽^2 = 螖_蟽x^2 + 螖_蟽y^2
+	 *
+	 * Note: As the 1/2 is a constant, it is applied "early" in the vertex
+	 * shader. As such, clipping to x蟽 standard deviations is done by clipping
+	 * at x^2 / 2, and no 1/2 is multiplied in here.
+	 */
+  float alpha_gaussian;
+  if (render_mode == SPLAT_RENDER_MODE_DEFAULT) {
+    alpha_gaussian = (sig_sq_div_2 < CUTOFF_RADIUS_SIGMA_SQUARED_OVER_2)
+                         ? in_color.a / exp(sig_sq_div_2)
+                         : 0.0f;
+  } else {
+    // Ellipse / point modes: solid fill inside the cutoff boundary (the
+    // boundary is the projected ellipse, or a circle in point mode).
+    alpha_gaussian = (sig_sq_div_2 < CUTOFF_RADIUS_SIGMA_SQUARED_OVER_2)
+                         ? in_color.a
+                         : 0.0f;
+  }
+  if (alpha_gaussian < alpha_discard_threshold) discard;
+#if AFTER_TONEMAP
+  if (depth_test_enable != 0u) {
+    // Manual reversed-Z depth test (matches CF_DepthNearOrEqual): the scene
+    // depth texture is at render resolution while we rasterize at output
+    // (post-upscale) resolution, so remap pixel coords to depth UVs.
+    float2 depth_uv = sv_position.xy * depth_uv_scale_bias.xy + depth_uv_scale_bias.zw;
+    float scene_device_z =
+        Texture2DSampleLevel(scene_depth_texture, scene_depth_sampler, depth_uv, 0).r;
+    if (sv_position.z < scene_device_z) discard;
+  }
+  // Scene color is display-encoded after tonemapping; match it so the splat
+  // keeps its authored appearance regardless of post processing.
+  out_color = float4(LinearToSrgb(in_color.rgb), alpha_gaussian);
+#else
+  // Mobile LDR preserves the v7.0 shader-side sRGB conversion. HDR scene
+  // color remains pre-exposed linear; alpha stays linear in both cases.
+  out_color = float4(SplatBeforeTonemapRGB(
+      in_color.rgb, mobile_ldr, mobile_hw_srgb, View.PreExposure), alpha_gaussian);
+#endif
+}
+

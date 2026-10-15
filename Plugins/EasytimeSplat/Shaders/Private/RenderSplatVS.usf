@@ -1,0 +1,94 @@
+/*
+  Copyright (c) 2025 PICO Technology Co., Ltd. See LICENSE.md.
+*/
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Public/Platform.ush"
+
+#include "../ThirdParty/Public/constants.ush"
+#include "../ThirdParty/Public/unpacking.ush"
+
+#define WITH_VIEW_ID USE_MULTI_VIEW_ID_SV
+
+// Scalar parameters - must match C++ struct order in FRenderSplatSharedParameters
+float4x4 local_to_world;
+uint sh_degree;
+uint sh_num_triplets;
+uint bUseHalfSH;
+float opacity;
+float brightness;
+float contrast;
+float3 color_tint;
+float3 pos_scale_cm;
+float3 pos_min_cm;
+uint bUseFloatPositions;
+float active_alpha_discard_threshold;
+float alpha_scale_threshold;
+// Clip-space temporal AA jitter to remove (non-zero only when compositing
+// after the tonemapper, where TAA can no longer resolve the jitter).
+float2 jitter_offset;
+// 0 = Gaussian (default), 1 = solid ellipse, 2 = point.
+uint render_mode;
+
+Buffer<uint> sh_coefficients_half;
+
+/**
+ * The View uniform buffer Unreal uses in UE 5.4+ uses DoubleFloat types.
+ * These store a separate translation vector alongside the transform, in
+ * order to improve accuracy.
+ * @see https://dev.epicgames.com/documentation/en-us/unreal-engine/large-world-coordinates-rendering-in-unreal-engine-5?application_version=5.4
+ * @see DoubleFloat.ush
+ *
+ * Similarly, Unreal has two different world spaces, Relative World and
+ * Translated World. The latter puts the origin at that of the View matrix,
+ * which is also supposed to improve accuracy. Thus, if we already have to
+ * do an extra addition here to translate the WorldToClip transform, we
+ * might as well use Translated World space.
+ * @see https://dev.epicgames.com/documentation/en-us/unreal-engine/coordinate-space-terminology?application_version=4.27
+ *
+ * We need a unique View matrix per eye, so the "proper" way is to go
+ * through ResolveView() and use what is available.
+ * @see InstancedStereo.ush
+ *
+ * Long story short, the following lines are roughly equivalent to:
+ *
+ * half4 PosClip = mul(PosWorld, WorldToClip[InViewID]);
+ *
+ * @param world - World-space position.
+ * @return Clip-space position.
+ */
+half4 world_to_clip(
+	half3 world
+#if WITH_VIEW_ID
+	,
+	uint in_view_id
+#endif
+)
+{
+
+#if USE_MULTI_VIEW_ID_SV
+	ResolvedView = ResolveView(in_view_id);
+#else
+	ResolvedView = ResolveView();
+#endif
+	world += local_to_world[3].xyz + ResolvedView.PreViewTranslationHigh;
+	half4 clip = mul(half4(world, 1), ResolvedView.TranslatedWorldToClip);
+	// The projection matrix bakes in the TAA/TSR sub-pixel jitter. When the
+	// splat is composited after AA (after-tonemap mode) nothing resolves that
+	// jitter anymore, so it must be removed here to avoid visible shaking.
+	clip.xy -= jitter_offset * clip.w;
+	return clip;
+}
+
+/**
+ * Get the current render resolution, taking into account dynamic resolution
+ * scaling.
+ *
+ * @return (width, height) in pixels.
+ */
+half2 get_render_resolution()
+{
+	return View.ViewSizeAndInvSize.xy / View.ViewResolutionFraction;
+}
+
+#include "../ThirdParty/Public/render_splat.vs.ush"

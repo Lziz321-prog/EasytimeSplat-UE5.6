@@ -1,0 +1,87 @@
+/*
+  Copyright (c) 2025 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+/**
+ * Global defines controlling the radius of each splat. This is not a scaling
+ * factor, but a limit to how far from the center of each Gaussian we will
+ * evaluate.
+ *
+ * Most 3DGS viewers seem to be using a sqrt(8)σ radius, so that's a good
+ * default.
+ */
+#define RADIUS_SIGMA sqrt(8)
+#define RADIUS_SIGMA_OVER_SQRT_2 (RADIUS_SIGMA / sqrt(2))
+#define CUTOFF_RADIUS_SIGMA_SQUARED_OVER_2 \
+  (RADIUS_SIGMA_OVER_SQRT_2 * RADIUS_SIGMA_OVER_SQRT_2)
+
+/**
+ * Splat rasterization modes (must match ESplatRenderMode in C++).
+ */
+#define SPLAT_RENDER_MODE_DEFAULT 0u
+#define SPLAT_RENDER_MODE_ELLIPSE 1u
+#define SPLAT_RENDER_MODE_POINT 2u
+
+/**
+ * Half-size, in pixels, of the screen-space quad used in point mode.
+ */
+#define SPLAT_POINT_MODE_RADIUS_PIXELS 2.0f
+
+/**
+ * Precision with which to sort splats, when using GPU sorting pipeline.
+ */
+#define DISTANCE_PRECISION 16
+#define DISTANCE_SCALE half((1 << DISTANCE_PRECISION) - 2)
+#define DISTANCE_NOT_VISIBLE ((1 << DISTANCE_PRECISION) - 1)
+
+/**
+ * Higher-precision depth keys for global/4D GPU sorting. Keep the generated key
+ * within 24 bits so float32 shader math can represent every integer exactly,
+ * avoiding float-to-uint overflow/rounding behavior near 2^32 on mobile GPUs.
+ */
+#define SPLAT_SORT_DEPTH_SCALE_24 16777214.0f
+#define SPLAT_SORT_DEPTH_NOT_VISIBLE_24 0x00FFFFFFu
+
+/**
+ * Near clip distance for view-space depth sorting (matches UE default near plane).
+ */
+#define SPLAT_SORT_NEAR_CLIP_CM 10.0f
+
+/**
+ * Projected covariance stabilization constants.
+ */
+#define PROJECTED_COVARIANCE_DIAGONAL_BIAS 0.3f
+#define PROJECTED_COVARIANCE_MIN_EIGENVALUE 0.1f
+#define PROJECTED_SPLAT_MAX_AXIS_PIXELS 1024.0f
+#define PROJECTED_SPLAT_MIN_AXIS_PIXELS_SQUARED 4.0f
+
+/** Shared strict visibility rule for gather and 4D interpolation. */
+bool splat_should_cull_active_alpha(float active_alpha, float threshold)
+{
+    bool finite_alpha =
+        (asuint(active_alpha) & 0x7f800000u) != 0x7f800000u;
+    bool finite_threshold =
+        (asuint(threshold) & 0x7f800000u) != 0x7f800000u;
+    return finite_alpha && finite_threshold && active_alpha < threshold;
+}
+
+/**
+ * Compute how much to shrink a splat's geometry based on its alpha, relative
+ * to the PS discard threshold. Splats with low alpha can use a smaller geometry
+ * since fragments near the edge will be discarded anyway.
+ *
+ * @param active_alpha - Current splat alpha (opacity already applied).
+ * @param alpha_cutoff_threshold - PS discard threshold (r.EasytimeSplat.AlphaDiscardThreshold).
+ * @return Scale factor in [0, 1] to apply to splat corners/axes.
+ */
+float splat_alpha_radius_scale(float active_alpha, float alpha_cutoff_threshold)
+{
+    if (alpha_cutoff_threshold <= 0.0f)
+    {
+        return 1.0f;
+    }
+
+    float ratio = alpha_cutoff_threshold / max(active_alpha, 1e-8f);
+    float radius = sqrt(max(-log(max(ratio, 1e-8f)), 0.0f));
+    return saturate(radius / RADIUS_SIGMA_OVER_SQRT_2);
+}

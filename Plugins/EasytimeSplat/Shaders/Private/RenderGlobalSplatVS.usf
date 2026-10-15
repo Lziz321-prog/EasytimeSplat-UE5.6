@@ -1,0 +1,173 @@
+/*
+  Copyright (c) 2025 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Public/Platform.ush"
+
+#include "../ThirdParty/Public/constants.ush"
+
+#define WITH_VIEW_ID USE_MULTI_VIEW_ID_SV
+
+Buffer<uint> SortedGlobalIndices;
+Buffer<float4> GlobalWorldCenters;
+Buffer<float4> GlobalTransforms;
+Buffer<float4> GlobalColors;
+
+#if SPLAT_MOBILE_BASE_PASS
+Buffer<uint> RightSortedGlobalIndices;
+Buffer<float4> RightGlobalWorldCenters;
+Buffer<float4> RightGlobalTransforms;
+Buffer<float4> RightGlobalColors;
+Buffer<uint> GPUValidCounts;
+uint use_gpu_valid_counts;
+uint use_half_global_transforms;
+uint render_mode;
+#else
+static const uint render_mode = SPLAT_RENDER_MODE_DEFAULT;
+#endif
+
+float active_alpha_discard_threshold;
+float alpha_scale_threshold;
+// Clip-space temporal AA jitter to remove (non-zero only when compositing
+// after the tonemapper, where TAA can no longer resolve the jitter).
+float2 jitter_offset;
+
+float4 world_to_clip(
+	float3 world
+#if WITH_VIEW_ID
+	,
+	uint in_view_id
+#endif
+)
+{
+#if USE_MULTI_VIEW_ID_SV
+	ResolvedView = ResolveView(in_view_id);
+#else
+	ResolvedView = ResolveView();
+#endif
+	world += ResolvedView.PreViewTranslationHigh;
+	float4 clip = mul(float4(world, 1), ResolvedView.TranslatedWorldToClip);
+	// The projection matrix bakes in the TAA/TSR sub-pixel jitter. When the
+	// splat is composited after AA (after-tonemap mode) nothing resolves that
+	// jitter anymore, so it must be removed here to avoid visible shaking.
+	clip.xy -= jitter_offset * clip.w;
+	return clip;
+}
+
+float2 get_render_resolution()
+{
+	return ResolvedView.ViewSizeAndInvSize.xy / ResolvedView.ViewResolutionFraction;
+}
+
+void main(in uint in_id : SV_VertexID,
+#if WITH_VIEW_ID
+          in uint in_view_id : SV_ViewID,
+#endif
+          out float2 out_sig_div_sqrt_2 : DELTA_STD_DEVS,
+          out nointerpolation float4 out_color : COLOR,
+          out float4 out_position : SV_Position) {
+  uint sorted_id = in_id / 6;
+#if SPLAT_MOBILE_BASE_PASS
+  uint valid_count = 0xffffffffu;
+  if (use_gpu_valid_counts != 0u)
+  {
+#if WITH_VIEW_ID
+    valid_count = GPUValidCounts[in_view_id != 0u ? 1u : 0u];
+#else
+    valid_count = GPUValidCounts[0];
+#endif
+  }
+  if (sorted_id >= valid_count)
+  {
+    out_position = float4(0.f, 0.f, 0.f, 0.f);
+    out_sig_div_sqrt_2 = 0.0f;
+    out_color = 0.0f;
+    return;
+  }
+#endif
+  uint splat_id = SortedGlobalIndices[sorted_id];
+
+  float4 base_color = GlobalColors[splat_id];
+  float3 pos_world = GlobalWorldCenters[splat_id].xyz;
+  float4 t = GlobalTransforms[splat_id];
+#if SPLAT_MOBILE_BASE_PASS && WITH_VIEW_ID
+  // Each eye has its own sorted IDs, projection, visibility and SH. Selecting
+  // only the view matrix would still reuse the other eye's shape/cull result.
+  if (in_view_id != 0u)
+  {
+    splat_id = RightSortedGlobalIndices[sorted_id];
+    base_color = RightGlobalColors[splat_id];
+    pos_world = RightGlobalWorldCenters[splat_id].xyz;
+    t = RightGlobalTransforms[splat_id];
+  }
+#endif
+
+  if (base_color.a < active_alpha_discard_threshold) {
+    out_position = float4(0.f, 0.f, 0.f, 0.f);
+    out_sig_div_sqrt_2 = 0.0f;
+    out_color = 0.0f;
+    return;
+  }
+
+  float4 pos_clip = world_to_clip(
+    pos_world
+#if WITH_VIEW_ID
+    , in_view_id
+#endif
+  );
+
+  bool outside_frustum = pos_clip.w <= 1e-6f ||
+                         pos_clip.z < 0.0f ||
+                         pos_clip.x < -pos_clip.w || pos_clip.x > pos_clip.w ||
+                         pos_clip.y < -pos_clip.w || pos_clip.y > pos_clip.w ||
+                         pos_clip.z > pos_clip.w;
+
+  if (outside_frustum) {
+    out_position = float4(0.f, 0.f, 0.f, 0.f);
+    out_sig_div_sqrt_2 = 0.0f;
+    out_color = 0.0f;
+    return;
+  }
+
+  if (render_mode == SPLAT_RENDER_MODE_POINT)
+  {
+    const float point_scale = SPLAT_POINT_MODE_RADIUS_PIXELS / RADIUS_SIGMA_OVER_SQRT_2;
+    t = float4(point_scale, 0.0f, 0.0f, point_scale);
+  }
+  else if (render_mode == SPLAT_RENDER_MODE_DEFAULT)
+  {
+    t *= splat_alpha_radius_scale(base_color.a, alpha_scale_threshold);
+  }
+
+  // Column norms: col0 = t.xz (scale.x), col1 = t.yw (scale.y).
+  float max_axis_sq = max(dot(t.xz, t.xz), dot(t.yw, t.yw));
+  // Compact gather already made this decision with the FP32 transform. Avoid
+  // changing point inclusion when the stored transform rounds to FP16.
+  bool skip_defensive_size_cull = false;
+#if SPLAT_MOBILE_BASE_PASS
+  skip_defensive_size_cull = use_half_global_transforms != 0u;
+#endif
+  if (!skip_defensive_size_cull && render_mode != SPLAT_RENDER_MODE_POINT &&
+      max_axis_sq < PROJECTED_SPLAT_MIN_AXIS_PIXELS_SQUARED) {
+    out_position = float4(0.f, 0.f, 0.f, 0.f);
+    out_sig_div_sqrt_2 = 0.0f;
+    out_color = 0.0f;
+    return;
+  }
+
+  float2 corners[6] = {
+      float2(-RADIUS_SIGMA_OVER_SQRT_2, -RADIUS_SIGMA_OVER_SQRT_2),
+      float2(RADIUS_SIGMA_OVER_SQRT_2, -RADIUS_SIGMA_OVER_SQRT_2),
+      float2(-RADIUS_SIGMA_OVER_SQRT_2, RADIUS_SIGMA_OVER_SQRT_2),
+      float2(RADIUS_SIGMA_OVER_SQRT_2, -RADIUS_SIGMA_OVER_SQRT_2),
+      float2(-RADIUS_SIGMA_OVER_SQRT_2, RADIUS_SIGMA_OVER_SQRT_2),
+      float2(RADIUS_SIGMA_OVER_SQRT_2, RADIUS_SIGMA_OVER_SQRT_2)};
+  float2 offset = mul(float2x2(t.x, t.y, t.z, t.w), corners[in_id % 6]);
+  offset /= get_render_resolution();
+
+  float clip_z = min(pos_clip.z, pos_clip.w);
+  out_position = float4(pos_clip.xy + offset * pos_clip.w, clip_z, pos_clip.w);
+  out_sig_div_sqrt_2 = corners[in_id % 6];
+  out_color = base_color;
+}

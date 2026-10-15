@@ -1,0 +1,9 @@
+{
+	"BuildId": "43139311",
+	"Modules": 
+	{
+		"EasytimeSplatEditor": "UnrealEditor-EasytimeSplatEditor.dll",
+		"EasytimeSplatRuntime": "UnrealEditor-EasytimeSplatRuntime.dll",
+		"EasytimeSplatThirdParty": "UnrealEditor-EasytimeSplatThirdParty.dll"
+	}
+}

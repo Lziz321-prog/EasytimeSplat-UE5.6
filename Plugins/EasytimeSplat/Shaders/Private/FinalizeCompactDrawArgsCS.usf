@@ -1,0 +1,83 @@
+/*
+  Copyright (c) 2025 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+#include "/Engine/Public/Platform.ush"
+#include "../ThirdParty/Public/constants.ush"
+
+uint num_eyes;
+uint num_splats;
+uint sort_depth_not_visible;
+#if USE_GPU_VALID_COUNTS
+Buffer<uint> left_valid_count;
+Buffer<uint> right_valid_count;
+#else
+Buffer<uint> left_sorted_distances;
+Buffer<uint> right_sorted_distances;
+#endif
+RWBuffer<uint> out_draw_indirect_args;
+#if WRITE_VALID_COUNTS
+RWBuffer<uint> out_valid_counts;
+#endif
+
+uint find_left_valid_prefix()
+{
+#if USE_GPU_VALID_COUNTS
+  return left_valid_count[0];
+#else
+  uint lower = 0u;
+  uint upper = num_splats;
+  while (lower < upper)
+  {
+    uint middle = lower + (upper - lower) / 2u;
+    if (left_sorted_distances[middle] < sort_depth_not_visible)
+    {
+      lower = middle + 1u;
+    }
+    else
+    {
+      upper = middle;
+    }
+  }
+  return lower;
+#endif
+}
+
+uint find_right_valid_prefix()
+{
+#if USE_GPU_VALID_COUNTS
+  return right_valid_count[0];
+#else
+  uint lower = 0u;
+  uint upper = num_splats;
+  while (lower < upper)
+  {
+    uint middle = lower + (upper - lower) / 2u;
+    if (right_sorted_distances[middle] < sort_depth_not_visible)
+    {
+      lower = middle + 1u;
+    }
+    else
+    {
+      upper = middle;
+    }
+  }
+  return lower;
+#endif
+}
+
+[numthreads(1, 1, 1)] void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
+{
+  uint left_count = find_left_valid_prefix();
+  uint right_count = num_eyes > 1u
+      ? find_right_valid_prefix() : left_count;
+#if WRITE_VALID_COUNTS
+  out_valid_counts[0] = left_count;
+  out_valid_counts[1] = right_count;
+#endif
+  uint visible_count = max(left_count, right_count);
+  out_draw_indirect_args[0] = visible_count * 6u;
+  out_draw_indirect_args[1] = 1u;
+  out_draw_indirect_args[2] = 0u;
+  out_draw_indirect_args[3] = 0u;
+}

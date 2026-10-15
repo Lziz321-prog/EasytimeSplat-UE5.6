@@ -1,0 +1,30 @@
+/*
+  Copyright (c) 2025 PICO Technology Co., Ltd. See LICENSE.md.
+*/
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/GammaCorrectionCommon.ush"
+#include "SplatOutputColor.ush"
+
+#include "../ThirdParty/Public/constants.ush"
+
+float alpha_discard_threshold;
+// LDR must not use pre-exposure. Keep v7.0's explicit shader-side sRGB
+// conversion for consistent Android XR appearance and splat alpha blending.
+uint mobile_ldr;
+uint mobile_hw_srgb;
+// 0 = Gaussian (default), 1 = solid ellipse, 2 = point.
+uint render_mode;
+
+#if AFTER_TONEMAP
+// Manual depth test inputs (post-tonemap pass cannot bind the depth buffer:
+// after TSR/TAAU upscaling its resolution differs from scene color).
+Texture2D scene_depth_texture;
+SamplerState scene_depth_sampler;
+// xy: scale, zw: bias mapping output-target pixel coords to depth texture UVs.
+float4 depth_uv_scale_bias;
+uint depth_test_enable;
+#endif
+
+#include "../ThirdParty/Public/render_splat.ps.ush"

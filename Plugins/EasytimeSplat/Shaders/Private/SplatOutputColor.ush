@@ -1,0 +1,17 @@
+#ifndef EASYTIME_SPLAT_OUTPUT_COLOR
+#define EASYTIME_SPLAT_OUTPUT_COLOR
+
+// Input is linear; alpha is deliberately handled separately by the caller.
+// Keep the legacy v7.0 Mobile LDR appearance by encoding splat RGB before
+// alpha blending. Some Android XR base-pass targets expose an sRGB scene
+// color configuration without applying the expected hardware conversion to
+// this extension draw.
+float3 SplatBeforeTonemapRGB(float3 linear_rgb, uint mobile_ldr,
+                            uint mobile_hw_srgb, float pre_exposure)
+{
+  if (mobile_ldr != 0u)
+    return LinearToSrgb(linear_rgb);
+  return linear_rgb * pre_exposure;
+}
+
+#endif

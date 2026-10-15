@@ -1,0 +1,100 @@
+/*
+  Copyright (c) 2026 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+
+#define NUM_THREADS_PER_GROUP 256
+#include "/Engine/Private/ThreadGroupPrefixSum.ush"
+
+uint num_splats;
+uint num_blocks;
+uint invalid_key;
+Buffer<uint> in_distances;
+Buffer<uint> in_indices;
+Buffer<uint> block_counts;
+Buffer<uint> block_offsets;
+RWBuffer<uint> out_block_counts;
+RWBuffer<uint> out_block_offsets;
+RWBuffer<uint> out_valid_count;
+RWBuffer<uint> out_distances;
+RWBuffer<uint> out_indices;
+
+[numthreads(NUM_THREADS_PER_GROUP, 1, 1)]
+void CountValidSplatBlocksCS(
+    uint3 group_id : SV_GroupID,
+    uint group_thread_index : SV_GroupIndex)
+{
+    const uint block_index = GetUnWrappedDispatchGroupId(group_id);
+    const uint source_index = block_index * NUM_THREADS_PER_GROUP + group_thread_index;
+    const uint is_valid = source_index < num_splats &&
+        in_distances[source_index] < invalid_key ? 1u : 0u;
+
+    uint block_sum = 0u;
+    ThreadGroupPrefixSum(is_valid, group_thread_index, block_sum);
+    if (group_thread_index == 0u && block_index < num_blocks)
+    {
+        out_block_counts[block_index] = block_sum;
+    }
+}
+
+groupshared uint scan_base;
+
+[numthreads(NUM_THREADS_PER_GROUP, 1, 1)]
+void ScanValidSplatBlockCountsCS(uint group_thread_index : SV_GroupIndex)
+{
+    if (group_thread_index == 0u)
+    {
+        scan_base = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint iteration_count =
+        (num_blocks + NUM_THREADS_PER_GROUP - 1u) / NUM_THREADS_PER_GROUP;
+    for (uint iteration = 0u; iteration < iteration_count; ++iteration)
+    {
+        const uint block_index = iteration * NUM_THREADS_PER_GROUP + group_thread_index;
+        const uint block_count = block_index < num_blocks ? block_counts[block_index] : 0u;
+        uint iteration_sum = 0u;
+        const uint prefix = ThreadGroupPrefixSum(
+            block_count, group_thread_index, iteration_sum);
+
+        if (block_index < num_blocks)
+        {
+            out_block_offsets[block_index] = scan_base + prefix;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (group_thread_index == 0u)
+        {
+            scan_base += iteration_sum;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (group_thread_index == 0u)
+    {
+        out_valid_count[0] = scan_base;
+    }
+}
+
+[numthreads(NUM_THREADS_PER_GROUP, 1, 1)]
+void ScatterValidSplatPairsCS(
+    uint3 group_id : SV_GroupID,
+    uint group_thread_index : SV_GroupIndex)
+{
+    const uint block_index = GetUnWrappedDispatchGroupId(group_id);
+    const uint source_index = block_index * NUM_THREADS_PER_GROUP + group_thread_index;
+    const uint is_valid = source_index < num_splats &&
+        in_distances[source_index] < invalid_key ? 1u : 0u;
+
+    uint block_sum = 0u;
+    const uint block_prefix = ThreadGroupPrefixSum(
+        is_valid, group_thread_index, block_sum);
+    if (is_valid != 0u)
+    {
+        const uint destination_index = block_offsets[block_index] + block_prefix;
+        out_distances[destination_index] = in_distances[source_index];
+        out_indices[destination_index] = in_indices[source_index];
+    }
+}

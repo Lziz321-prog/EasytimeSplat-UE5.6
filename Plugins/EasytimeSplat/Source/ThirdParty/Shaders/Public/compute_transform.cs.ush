@@ -1,0 +1,121 @@
+/*
+  Copyright (c) 2025 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+/**
+ * Required headers:
+ * - constants.hlsl
+ * - unpacking.hlsl
+ *
+ * Required shaders constants:
+ * - local_to_view
+ * - two_focal_length
+ * - debug_scale_factor
+ * - num_splats
+ * - pos_scale_cm
+ * - pos_min_cm
+ */
+
+Buffer<uint> positions;
+Buffer<float4> positions_float;
+Buffer<uint2> covariances;
+Buffer<float4> covariances_float;
+RWBuffer<float4> transforms;
+uint bUseFloatPositions;
+uint bUseFloatCovariances;
+
+float3x3 load_cov_mat(uint splat_id)
+{
+  if (bUseFloatCovariances != 0u)
+  {
+    uint cov_base = splat_id * 2u;
+    float4 c0 = covariances_float[cov_base + 0u];
+    float4 c1 = covariances_float[cov_base + 1u];
+    return float3x3(c0.x, c0.y, c0.z, c0.y, c0.w, c1.x, c0.z, c1.x, c1.y);
+  }
+
+  return unpack_cov_mat(covariances[splat_id]);
+}
+
+/**
+ * Calculate a 2x2 transform for projecting a splat into screen space.
+ * Uses effective_z to clamp near-clip splats, applies diagonal bias for
+ * stability, enforces minimum eigenvalue and clamps max axis pixels.
+ *
+ * The dispatch may be wrapped onto Y/Z for large splat counts (see
+ * FComputeShaderUtils::GetGroupCountWrapped), so the linear splat index is
+ * rebuilt from the group id.
+ */
+[numthreads(THREAD_GROUP_SIZE_X, 1, 1)] void main(
+    uint3 group_id : SV_GroupID,
+    uint group_index : SV_GroupIndex) {
+  uint splat_id =
+      GetUnWrappedDispatchThreadId(group_id, group_index, THREAD_GROUP_SIZE_X);
+
+  if (splat_id >= num_splats) {
+    return;
+  }
+
+  float4 pos_local = bUseFloatPositions != 0u
+                         ? positions_float[splat_id]
+                         : unpack_pos(positions[splat_id], pos_scale_cm, pos_min_cm);
+  float3 pos_view = mul(pos_local, local_to_view);
+
+  if (pos_view.z <= 0.0f) {
+    transforms[splat_id] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    return;
+  }
+
+  float effective_z = max(pos_view.z, SPLAT_SORT_NEAR_CLIP_CM);
+
+  float3x3 sig = load_cov_mat(splat_id);
+
+  float3x3 W = float3x3(local_to_view[0].xyz, local_to_view[1].xyz,
+                        local_to_view[2].xyz);
+
+  float scale_x = -pos_view.x / effective_z;
+  float scale_y = -pos_view.y / effective_z;
+
+  float3 jw_0 = float3(W[0][0] + scale_x * W[0][2], W[1][0] + scale_x * W[1][2],
+                       W[2][0] + scale_x * W[2][2]);
+
+  float3 jw_1 = float3(W[0][1] + scale_y * W[0][2], W[1][1] + scale_y * W[1][2],
+                       W[2][1] + scale_y * W[2][2]);
+
+  float3 jw_sig_0 = mul(jw_0, sig);
+  float3 jw_sig_1 = mul(jw_1, sig);
+
+  float sig_p_00 = mul(jw_sig_0, jw_0);
+  float sig_p_01 = mul(jw_sig_0, jw_1);
+  float sig_p_11 = mul(jw_sig_1, jw_1);
+
+  // Convert to screen-space (pixels²) first, then add bias and clamp eigenvalues.
+  // Bias/min-eigenvalue are in pixel² units so they are scale-invariant.
+  float focal_over_z = two_focal_length / effective_z;
+  float foz_sq = focal_over_z * focal_over_z;
+  float cov_00 = foz_sq * sig_p_00 + PROJECTED_COVARIANCE_DIAGONAL_BIAS;
+  float cov_01 = foz_sq * sig_p_01;
+  float cov_11 = foz_sq * sig_p_11 + PROJECTED_COVARIANCE_DIAGONAL_BIAS;
+
+  float det = cov_00 * cov_11 - cov_01 * cov_01;
+  float trace = cov_00 + cov_11;
+  float sqrt_disc = sqrt(max(trace * trace - 4.0f * det, 0.0f));
+  float2 two_lmb = float2(trace + sqrt_disc, trace - sqrt_disc);
+  two_lmb = max(two_lmb, float2(PROJECTED_COVARIANCE_MIN_EIGENVALUE, PROJECTED_COVARIANCE_MIN_EIGENVALUE));
+
+  // sqrt_two_sigma is now directly in pixels — no further focal_over_z multiplication.
+  float2 sqrt_two_sigma = sqrt(two_lmb);
+  float2 v_0_raw = float2(cov_01, two_lmb.x / 2.0f - cov_00);
+  float v_len_sq = dot(v_0_raw, v_0_raw);
+  float2 v_0 = (v_len_sq > 1e-12f) ? v_0_raw * rsqrt(v_len_sq) : float2(1.0f, 0.0f);
+
+  float2 scale = sqrt_two_sigma * debug_scale_factor;
+
+  if (any(isnan(scale)) || any(isinf(scale))) {
+    transforms[splat_id] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    return;
+  }
+  scale = min(scale, float2(PROJECTED_SPLAT_MAX_AXIS_PIXELS, PROJECTED_SPLAT_MAX_AXIS_PIXELS));
+
+  transforms[splat_id] = float4(v_0.x, -v_0.y, v_0.y, v_0.x) * scale.xyxy;
+}

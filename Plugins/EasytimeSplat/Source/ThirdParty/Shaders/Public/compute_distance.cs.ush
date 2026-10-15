@@ -1,0 +1,69 @@
+/*
+  Copyright (c) 2025 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+/**
+ * Required headers:
+ * - constants.hlsl
+ * - unpacking.hlsl
+ *
+ * Required shaders constants:
+ * - local_to_clip
+ * - local_to_view
+ * - num_splats
+ * - pos_scale_cm
+ * - pos_min_cm
+ */
+
+Buffer<uint> positions;
+Buffer<float4> positions_float;
+RWBuffer<uint> indices;
+RWBuffer<uint> distances;
+uint bUseFloatPositions;
+uint distance_scale;
+uint distance_not_visible;
+
+/**
+ * Measure the distance to a splat using view-space depth for consistent sorting.
+ *
+ * The dispatch may be wrapped onto Y/Z for large splat counts (see
+ * FComputeShaderUtils::GetGroupCountWrapped), so the linear splat index is
+ * rebuilt from the group id.
+ */
+[numthreads(THREAD_GROUP_SIZE_X, 1, 1)] void main(
+    uint3 group_id : SV_GroupID,
+    uint group_index : SV_GroupIndex) {
+  uint splat_id =
+      GetUnWrappedDispatchThreadId(group_id, group_index, THREAD_GROUP_SIZE_X);
+  if (splat_id >= num_splats) {
+    return;
+  }
+
+  float4 pos_local = bUseFloatPositions != 0u
+                         ? positions_float[splat_id]
+                         : unpack_pos(positions[splat_id], pos_scale_cm, pos_min_cm);
+
+  float3 pos_view = mul(pos_local, local_to_view).xyz;
+  float4 pos_clip = mul(pos_local, local_to_clip);
+
+  bool inside_frustum = pos_view.z > 0.0f &&
+                        pos_clip.w > 1e-6f &&
+                        pos_clip.x >= -pos_clip.w && pos_clip.x <= pos_clip.w &&
+                        pos_clip.y >= -pos_clip.w && pos_clip.y <= pos_clip.w;
+
+  uint index = splat_id;
+  uint distance;
+  if (inside_frustum)
+  {
+    float sort_z = max(pos_view.z, SPLAT_SORT_NEAR_CLIP_CM);
+    float normalized_depth = saturate(SPLAT_SORT_NEAR_CLIP_CM / sort_z);
+    distance = uint(normalized_depth * float(distance_scale));
+  }
+  else
+  {
+    distance = distance_not_visible;
+  }
+
+  indices[splat_id] = index;
+  distances[splat_id] = distance;
+}

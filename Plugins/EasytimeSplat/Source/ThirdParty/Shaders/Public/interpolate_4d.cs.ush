@@ -1,0 +1,409 @@
+/*
+  Copyright (c) 2025 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+// Scalar parameters must come first (matching C++ struct order)
+float current_frame;
+uint total_frames;
+uint num_xyz_banks;
+uint num_rot_banks;
+uint num_dc_banks;
+uint num_scale_banks;
+uint num_opacity_banks;
+uint xyz_stride;
+uint rot_stride;
+uint dc_stride;
+uint scale_stride;
+uint opacity_stride;
+uint num_splats;
+uint num_sh_triplets;
+uint b_quantized_ply4;
+float3 pos_scale_cm;
+float3 pos_min_cm;
+uint dynamic_alpha_early_out;
+float active_alpha_threshold;
+float component_opacity;
+
+// SRV parameters (second)
+Buffer<float4> xyz_bank;
+Buffer<float4> rot_bank;
+Buffer<float4> dc_bank;
+Buffer<float2> lifetime_mu_w;
+Buffer<float4> scales;
+Buffer<float4> base_colors;
+Buffer<uint> quantized_ply4;
+
+// UAV parameters (third)
+RWBuffer<uint> out_positions;
+RWBuffer<uint2> out_covariances;
+RWBuffer<float4> out_colors;
+
+float load_ply4_half(uint scalar_index) {
+    uint packed = quantized_ply4[scalar_index >> 1u];
+    uint bits = (packed >> ((scalar_index & 1u) * 16u)) & 0xffffu;
+    return f16tof32(bits);
+}
+
+float2 load_ply4_half2(uint scalar_index) {
+    return float2(load_ply4_half(scalar_index), load_ply4_half(scalar_index + 1u));
+}
+
+float3 load_ply4_half3(uint scalar_index) {
+    return float3(
+        load_ply4_half(scalar_index),
+        load_ply4_half(scalar_index + 1u),
+        load_ply4_half(scalar_index + 2u));
+}
+
+float4 load_ply4_half4(uint scalar_index) {
+    return float4(
+        load_ply4_half(scalar_index),
+        load_ply4_half(scalar_index + 1u),
+        load_ply4_half(scalar_index + 2u),
+        load_ply4_half(scalar_index + 3u));
+}
+
+uint ply4_base_stride() { return 16u + 3u * num_sh_triplets; }
+uint ply4_xyz_start() { return num_splats * ply4_base_stride(); }
+uint ply4_rot_start() { return ply4_xyz_start() + num_splats * num_xyz_banks * 3u; }
+uint ply4_dc_start() { return ply4_rot_start() + num_splats * num_rot_banks * 4u; }
+uint ply4_scale_start() { return ply4_dc_start() + num_splats * num_dc_banks * 3u; }
+uint ply4_opacity_start() { return ply4_scale_start() + num_splats * num_scale_banks * 3u; }
+
+// Simple packing for UNorm
+uint to_unorm(float f, uint bits) {
+    uint max_val = (1u << bits) - 1u;
+    return uint(saturate(f) * float(max_val) + 0.5f);
+}
+
+float3 dc_to_linear_rgb(float3 dc) {
+    // DC is still an SH coefficient here. Preserve both negative and >1 RGB
+    // values until directional SH has been added by the gather/vertex path.
+    return 0.5f + 0.2820948f * dc;
+}
+
+uint pack_position(float3 position_cm) {
+    const float3 codes = float3(2047.0f, 2047.0f, 1023.0f);
+    const float3 range_cm = max(pos_scale_cm * codes, float3(1e-6f, 1e-6f, 1e-6f));
+    const float3 n = saturate((position_cm - pos_min_cm) / range_cm);
+    return to_unorm(n.x, 11u) |
+        (to_unorm(n.y, 11u) << 11u) |
+        (to_unorm(n.z, 10u) << 22u);
+}
+
+void get_bank_lerp(
+    uint num_banks,
+    uint stride,
+    float frame,
+    out uint key0,
+    out uint key1,
+    out float alpha)
+{
+    key0 = 0u;
+    key1 = 0u;
+    alpha = 0.0f;
+    if (num_banks <= 1u)
+    {
+        return;
+    }
+
+    const uint safe_stride = max(1u, stride);
+    const float last_frame = float(max(1u, total_frames) - 1u);
+    const float t = clamp(frame, 0.0f, last_frame);
+
+    // The final key is always at total_frames - 1, so the last interval may
+    // be shorter than stride (for example F=90,S=30 -> [0,30,60,89]).
+    key0 = min(uint(floor(t / float(safe_stride))), num_banks - 2u);
+    key1 = key0 + 1u;
+    const float time0 = float(key0 * safe_stride);
+    const float time1 = (key1 == num_banks - 1u)
+        ? last_frame
+        : min(float(key1 * safe_stride), last_frame);
+    alpha = saturate((t - time0) / max(time1 - time0, 1e-6f));
+}
+
+float4 slerp_quat(float4 q0, float4 q1, float t)
+{
+    float cos_theta = dot(q0, q1);
+    if (cos_theta < 0.0f)
+    {
+        q1 = -q1;
+        cos_theta = -cos_theta;
+    }
+
+    if (cos_theta > 0.9995f)
+    {
+        return normalize(lerp(q0, q1, t));
+    }
+
+    float theta = acos(clamp(cos_theta, -1.0f, 1.0f));
+    float sin_theta = sin(theta);
+    float w0 = sin((1.0f - t) * theta) / max(sin_theta, 1e-6f);
+    float w1 = sin(t * theta) / max(sin_theta, 1e-6f);
+    return normalize(q0 * w0 + q1 * w1);
+}
+
+// Float to custom 5e5/5e6 format (simplified for GPU)
+uint to_custom_float(float f, uint signed_bits, uint exp_bits, uint sig_bits) {
+    // This is a simplified version of ToFloat from PackedTypes.h
+    // For variances/orientations, we just need enough precision
+    if (f == 0.0f) return 0;
+    
+    uint raw = asuint(f);
+    uint sign = (raw >> 31) & signed_bits;
+    int exponent = int((raw >> 23) & 0xFF) - 127;
+    uint mantissa = raw & 0x7FFFFF;
+    
+    int bias = (1 << (exp_bits - 1)) - 1;
+    exponent = clamp(exponent, -bias + 1, bias);
+    uint e_packed = uint(exponent + bias) << sig_bits;
+    uint m_packed = mantissa >> (23 - sig_bits);
+    
+    if (signed_bits > 0) {
+        return (sign << (exp_bits + sig_bits)) | (e_packed & ((1u << (exp_bits + sig_bits)) - 1u)) | m_packed; 
+    }
+    return e_packed | m_packed;
+}
+
+uint2 pack_covariance(float3x3 sigma) {
+    uint xx = to_custom_float(sigma[0][0], 0u, 5u, 5u);
+    uint xy = to_custom_float(sigma[0][1], 1u, 5u, 5u);
+    uint xz = to_custom_float(sigma[0][2], 1u, 5u, 5u);
+    uint yy = to_custom_float(sigma[1][1], 0u, 5u, 5u);
+    uint yz = to_custom_float(sigma[1][2], 1u, 5u, 5u);
+    uint zz = to_custom_float(sigma[2][2], 0u, 5u, 6u);
+    return uint2((yy << 22u) | (yz << 11u) | zz,
+                 (xx << 22u) | (xy << 11u) | xz);
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, 1, 1)]
+void main(uint3 group_id : SV_GroupID, uint group_index : SV_GroupIndex) {
+    // Dispatch may be wrapped onto Y/Z for large splat counts.
+    uint i =
+        GetUnWrappedDispatchThreadId(group_id, group_index, THREAD_GROUP_SIZE_X);
+    if (i >= num_splats) return;
+
+    // 1. Lifetime gating
+    // lifetime_mu_w stores (mu, w). Keep splat visible inside [mu - w, mu + w]
+    // with smooth edges; if w is invalid, fall back to fully visible.
+    const uint base_scalar = i * ply4_base_stride();
+    float2 mu_w = b_quantized_ply4 != 0u
+        ? load_ply4_half2(base_scalar + 14u)
+        : lifetime_mu_w[i];
+    float mu = mu_w.x;
+    float w = mu_w.y;
+    float opacity_multiplier = 1.0f;
+    if (w > 1e-6f)
+    {
+        const float k = 10.0f;
+        float arg_left = k * (current_frame - (mu - w));
+        float arg_right = -k * (current_frame - (mu + w));
+        float left = 1.0f / (1.0f + exp(-arg_left));
+        float right = 1.0f / (1.0f + exp(-arg_right));
+        opacity_multiplier = saturate(left * right);
+
+	}
+
+    // Resolve the interpolated asset alpha before the expensive position,
+    // covariance, and RGB work. The component multiplier participates only in
+    // the visibility decision; out_colors keeps asset alpha for the gather.
+    float base_alpha = 1.0f;
+    if (b_quantized_ply4 != 0u)
+    {
+        float raw_opacity = load_ply4_half(base_scalar + 13u);
+        if (num_opacity_banks > 0u)
+        {
+            uint k_opacity_0 = 0u;
+            uint k_opacity_1 = 0u;
+            float alpha_opacity = 0.0f;
+            get_bank_lerp(
+                num_opacity_banks,
+                opacity_stride,
+                current_frame,
+                k_opacity_0,
+                k_opacity_1,
+                alpha_opacity);
+            float opacity0 = load_ply4_half(
+                ply4_opacity_start() + i * num_opacity_banks + k_opacity_0);
+            float opacity1 = load_ply4_half(
+                ply4_opacity_start() + i * num_opacity_banks + k_opacity_1);
+            raw_opacity = lerp(opacity0, opacity1, alpha_opacity);
+        }
+        base_alpha = saturate(1.0f / (1.0f + exp(-raw_opacity)));
+    }
+    else
+    {
+        base_alpha = saturate(base_colors[i].a);
+    }
+    float interpolated_alpha = base_alpha * opacity_multiplier;
+    float active_alpha = interpolated_alpha * component_opacity;
+    if (dynamic_alpha_early_out != 0u &&
+        splat_should_cull_active_alpha(active_alpha, active_alpha_threshold))
+    {
+        // These outputs remain valid and deterministic for cache reuse. No
+        // source point is removed; a later frame/opacity change dispatches
+        // again and restores the full interpolated data when alpha reaches the
+        // threshold (the comparison is intentionally strict).
+        out_positions[i] = 0u;
+        out_covariances[i] = uint2(0u, 0u);
+        out_colors[i] = float4(0.0f, 0.0f, 0.0f, interpolated_alpha);
+        return;
+    }
+    
+    // 2. Interpolate XYZ
+    uint k_xyz_0 = 0;
+    uint k_xyz_1 = 0;
+    float alpha_xyz = 0.0f;
+    get_bank_lerp(
+        num_xyz_banks,
+        xyz_stride,
+        current_frame,
+        k_xyz_0,
+        k_xyz_1,
+        alpha_xyz);
+    float3 p0 = b_quantized_ply4 != 0u
+        ? load_ply4_half3(ply4_xyz_start() + (i * num_xyz_banks + k_xyz_0) * 3u)
+        : xyz_bank[i * num_xyz_banks + k_xyz_0].xyz;
+    float3 p1 = b_quantized_ply4 != 0u
+        ? load_ply4_half3(ply4_xyz_start() + (i * num_xyz_banks + k_xyz_1) * 3u)
+        : xyz_bank[i * num_xyz_banks + k_xyz_1].xyz;
+    float3 p_interp = lerp(p0, p1, alpha_xyz);
+    
+    // Position in UE centimeters (Z+ forward, X+ right, Y- up -> X+ forward, Y+ right, Z+ up).
+    float3 p_ue = float3(p_interp.z, p_interp.x, -p_interp.y);
+    float3 p_cm = p_ue * 100.0f;
+    out_positions[i] = pack_position(p_cm);
+
+    // 3. Interpolate Rotation & Scale
+    uint k_rot_0 = 0;
+    uint k_rot_1 = 0;
+    float alpha_rot = 0.0f;
+    get_bank_lerp(
+        num_rot_banks,
+        rot_stride,
+        current_frame,
+        k_rot_0,
+        k_rot_1,
+        alpha_rot);
+    float4 r0;
+    float4 r1;
+    if (b_quantized_ply4 != 0u)
+    {
+        // Stored source order is WXYZ; convert to UE XYZW basis here.
+        float4 raw0 = load_ply4_half4(
+            ply4_rot_start() + (i * num_rot_banks + k_rot_0) * 4u);
+        float4 raw1 = load_ply4_half4(
+            ply4_rot_start() + (i * num_rot_banks + k_rot_1) * 4u);
+        r0 = float4(-raw0.w, -raw0.y, raw0.z, raw0.x);
+        r1 = float4(-raw1.w, -raw1.y, raw1.z, raw1.x);
+        r0 = dot(r0, r0) > 1e-12f ? normalize(r0) : float4(0, 0, 0, 1);
+        r1 = dot(r1, r1) > 1e-12f ? normalize(r1) : float4(0, 0, 0, 1);
+    }
+    else
+    {
+        r0 = rot_bank[i * num_rot_banks + k_rot_0];
+        r1 = rot_bank[i * num_rot_banks + k_rot_1];
+    }
+    // Quaternion shortest-path interpolation: q and -q represent same rotation.
+    // Without this, interpolation may flip through the long arc and explode.
+    if (dot(r0, r1) < 0.0f)
+    {
+        r1 = -r1;
+    }
+	float4 r_interp = slerp_quat(r0, r1, alpha_rot);
+    
+    // rot_bank is already converted to UE basis during import.
+    // Do NOT swizzle again here, otherwise rotation is applied twice.
+    float qx = r_interp.x;
+    float qy = r_interp.y;
+    float qz = r_interp.z;
+    float qw = r_interp.w;
+    
+    // Compute Covariance Sigma = R * S * S^T * R^T
+    float3 scale_m;
+	if (b_quantized_ply4 != 0u)
+	{
+		float3 raw_log_scale = load_ply4_half3(base_scalar + 7u);
+		if (num_scale_banks > 0u)
+		{
+			uint k_scale_0 = 0u;
+			uint k_scale_1 = 0u;
+			float alpha_scale = 0.0f;
+			get_bank_lerp(
+				num_scale_banks,
+				scale_stride,
+				current_frame,
+				k_scale_0,
+				k_scale_1,
+				alpha_scale);
+			float3 scale0 = load_ply4_half3(
+				ply4_scale_start() + (i * num_scale_banks + k_scale_0) * 3u);
+			float3 scale1 = load_ply4_half3(
+				ply4_scale_start() + (i * num_scale_banks + k_scale_1) * 3u);
+			raw_log_scale = lerp(scale0, scale1, alpha_scale);
+		}
+		scale_m = exp(float3(raw_log_scale.z, raw_log_scale.x, raw_log_scale.y));
+    }
+    else
+    {
+        scale_m = scales[i].xyz;
+    }
+    float3 s = clamp(abs(scale_m) * 100.0f, float3(1e-4f, 1e-4f, 1e-4f), float3(1e4f, 1e4f, 1e4f)); // CM
+    // Construct R matrix
+    float3x3 R;
+    R[0][0] = 1.0f - 2.0f * (qy * qy + qz * qz);
+    R[0][1] = 2.0f * (qx * qy - qz * qw);
+    R[0][2] = 2.0f * (qx * qz + qy * qw);
+    R[1][0] = 2.0f * (qx * qy + qz * qw);
+    R[1][1] = 1.0f - 2.0f * (qx * qx + qz * qz);
+    R[1][2] = 2.0f * (qy * qz - qx * qw);
+    R[2][0] = 2.0f * (qx * qz - qy * qw);
+    R[2][1] = 2.0f * (qy * qz + qx * qw);
+    R[2][2] = 1.0f - 2.0f * (qx * qx + qy * qy);
+    
+    float3x3 S = float3x3(s.x, 0, 0, 0, s.y, 0, 0, 0, s.z);
+    float3x3 RS = mul(R, S);
+    float3x3 Sigma = mul(RS, transpose(RS));
+    if (any(isnan(Sigma[0])) || any(isnan(Sigma[1])) || any(isnan(Sigma[2])) ||
+        any(isinf(Sigma[0])) || any(isinf(Sigma[1])) || any(isinf(Sigma[2])))
+    {
+        Sigma = float3x3(
+            1e-4f, 0.0f, 0.0f,
+            0.0f, 1e-4f, 0.0f,
+            0.0f, 0.0f, 1e-4f);
+    }
+    Sigma[0] = clamp(Sigma[0], float3(-1e8f, -1e8f, -1e8f), float3(1e8f, 1e8f, 1e8f));
+    Sigma[1] = clamp(Sigma[1], float3(-1e8f, -1e8f, -1e8f), float3(1e8f, 1e8f, 1e8f));
+    Sigma[2] = clamp(Sigma[2], float3(-1e8f, -1e8f, -1e8f), float3(1e8f, 1e8f, 1e8f));
+    
+    out_covariances[i] = pack_covariance(Sigma);
+    
+    // 4. Color. Alpha was resolved before the expensive interpolation work.
+    float3 rgb = b_quantized_ply4 != 0u
+        ? dc_to_linear_rgb(load_ply4_half3(base_scalar + 10u))
+        : base_colors[i].rgb;
+    if (num_dc_banks > 0u)
+    {
+        uint k_dc_0 = 0;
+        uint k_dc_1 = 0;
+        float alpha_dc = 0.0f;
+        get_bank_lerp(
+            num_dc_banks,
+            dc_stride,
+            current_frame,
+            k_dc_0,
+            k_dc_1,
+            alpha_dc);
+
+        float3 dc0 = b_quantized_ply4 != 0u
+            ? load_ply4_half3(ply4_dc_start() + (i * num_dc_banks + k_dc_0) * 3u)
+            : dc_bank[i * num_dc_banks + k_dc_0].xyz;
+        float3 dc1 = b_quantized_ply4 != 0u
+            ? load_ply4_half3(ply4_dc_start() + (i * num_dc_banks + k_dc_1) * 3u)
+            : dc_bank[i * num_dc_banks + k_dc_1].xyz;
+        float3 dc_interp = lerp(dc0, dc1, alpha_dc);
+        rgb = dc_to_linear_rgb(dc_interp);
+    }
+
+    out_colors[i] = float4(rgb, interpolated_alpha);
+}

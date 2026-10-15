@@ -1,0 +1,57 @@
+/*
+  Copyright (c) 2025 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+
+#include "../ThirdParty/Public/constants.ush"
+#include "../ThirdParty/Public/unpacking.ush"
+
+float4x4 local_to_world;
+float4x4 local_to_view;
+float4x4 local_to_clip;
+uint global_offset;
+uint num_splats;
+uint sh_degree;
+uint sh_num_triplets;
+float two_focal_length;
+float debug_scale_factor;
+float max_projected_axis_pixels;
+uint early_alpha_cull;
+float active_alpha_threshold;
+uint sort_depth_not_visible;
+float sort_depth_scale;
+float opacity;
+float brightness;
+float contrast;
+float3 color_tint;
+float3 world_camera_origin;
+float3 pos_min_cm;
+float3 pos_scale_cm;
+
+Buffer<uint> positions;
+Buffer<float4> positions_float;
+uint bUseFloatPositions;
+Buffer<uint2> covariances;
+Buffer<float4> covariances_float;
+uint bUseFloatCovariances;
+Buffer<float4> colors;
+Buffer<float4> sh_coefficients;
+uint bUseHalfSH;
+Buffer<uint> sh_coefficients_half;
+#if SAMPLE_SPLATS
+uint source_num_splats;
+#endif
+#if COMPACT_DRAW
+uint compact_eye_index;
+float alpha_scale_threshold;
+float min_projected_axis_pixels_squared;
+#endif
+RWBuffer<uint> out_global_indices;
+RWBuffer<uint> out_global_distances;
+RWBuffer<float4> out_global_world_centers;
+RWBuffer<float4> out_global_transforms;
+RWBuffer<float4> out_global_colors;
+
+#include "../ThirdParty/Public/gather_proxy_render_data_to_global.cs.ush"

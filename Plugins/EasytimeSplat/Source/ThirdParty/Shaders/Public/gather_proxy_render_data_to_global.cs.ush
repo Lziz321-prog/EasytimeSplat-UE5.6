@@ -1,0 +1,309 @@
+/*
+  Copyright (c) 2025 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+static const float SH_C1 = 0.4886025119029199f;
+static const float SH_C2_0 = 1.0925484305920792f;
+static const float SH_C2_1 = -1.0925484305920792f;
+static const float SH_C2_2 = 0.31539156525252005f;
+static const float SH_C2_3 = -1.0925484305920792f;
+static const float SH_C2_4 = 0.5462742152960396f;
+static const float SH_C3_0 = -0.5900435899266435f;
+static const float SH_C3_1 = 2.890611442640554f;
+static const float SH_C3_2 = -0.4570457994644658f;
+static const float SH_C3_3 = 0.3731763325901154f;
+static const float SH_C3_4 = -0.4570457994644658f;
+static const float SH_C3_5 = 1.445305721320277f;
+static const float SH_C3_6 = -0.5900435899266435f;
+
+float load_half_sh_scalar(uint scalar_index)
+{
+  uint packed = sh_coefficients_half[scalar_index >> 1u];
+  return f16tof32((packed >> ((scalar_index & 1u) * 16u)) & 0xffffu);
+}
+
+float3 load_sh_triplet(uint coefficient_index)
+{
+  if (bUseHalfSH == 0u)
+  {
+    return sh_coefficients[coefficient_index].xyz;
+  }
+  uint splat_id = coefficient_index / sh_num_triplets;
+  uint triplet = coefficient_index - splat_id * sh_num_triplets;
+  uint scalar = splat_id * (16u + 3u * sh_num_triplets) + 16u + triplet * 3u;
+  return float3(
+    load_half_sh_scalar(scalar),
+    load_half_sh_scalar(scalar + 1u),
+    load_half_sh_scalar(scalar + 2u));
+}
+
+float3x3 load_cov_mat(uint splat_id)
+{
+  if (bUseFloatCovariances != 0u)
+  {
+    uint cov_base = splat_id * 2u;
+    float4 c0 = covariances_float[cov_base + 0u];
+    float4 c1 = covariances_float[cov_base + 1u];
+    return float3x3(c0.x, c0.y, c0.z, c0.y, c0.w, c1.x, c0.z, c1.x, c1.y);
+  }
+
+  return unpack_cov_mat(covariances[splat_id]);
+}
+
+float3 eval_sh(uint splat_id, float3 view_dir_src)
+{
+  if (sh_degree == 0u || sh_num_triplets == 0u)
+  {
+    return 0.0f;
+  }
+
+  uint base_idx = splat_id * sh_num_triplets;
+  float x = view_dir_src.x;
+  float y = view_dir_src.y;
+  float z = view_dir_src.z;
+  float3 result = 0.0f;
+
+  if (sh_num_triplets >= 3u)
+  {
+    float3 sh1 = load_sh_triplet(base_idx + 0u);
+    float3 sh2 = load_sh_triplet(base_idx + 1u);
+    float3 sh3 = load_sh_triplet(base_idx + 2u);
+    result += SH_C1 * (-sh1 * y + sh2 * z - sh3 * x);
+  }
+
+  if (sh_degree >= 2u && sh_num_triplets >= 8u)
+  {
+    float xx = x * x;
+    float yy = y * y;
+    float zz = z * z;
+    float xy = x * y;
+    float yz = y * z;
+    float xz = x * z;
+
+    float3 sh4 = load_sh_triplet(base_idx + 3u);
+    float3 sh5 = load_sh_triplet(base_idx + 4u);
+    float3 sh6 = load_sh_triplet(base_idx + 5u);
+    float3 sh7 = load_sh_triplet(base_idx + 6u);
+    float3 sh8 = load_sh_triplet(base_idx + 7u);
+
+    result +=
+      sh4 * (SH_C2_0 * xy) +
+      sh5 * (SH_C2_1 * yz) +
+      sh6 * (SH_C2_2 * (2.0f * zz - xx - yy)) +
+      sh7 * (SH_C2_3 * xz) +
+      sh8 * (SH_C2_4 * (xx - yy));
+
+    if (sh_degree >= 3u && sh_num_triplets >= 15u)
+    {
+      float3 sh9 = load_sh_triplet(base_idx + 8u);
+      float3 sh10 = load_sh_triplet(base_idx + 9u);
+      float3 sh11 = load_sh_triplet(base_idx + 10u);
+      float3 sh12 = load_sh_triplet(base_idx + 11u);
+      float3 sh13 = load_sh_triplet(base_idx + 12u);
+      float3 sh14 = load_sh_triplet(base_idx + 13u);
+      float3 sh15 = load_sh_triplet(base_idx + 14u);
+
+      result +=
+        sh9  * (SH_C3_0 * y * (3.0f * xx - yy)) +
+        sh10 * (SH_C3_1 * xy * z) +
+        sh11 * (SH_C3_2 * y * (4.0f * zz - xx - yy)) +
+        sh12 * (SH_C3_3 * z * (2.0f * zz - 3.0f * xx - 3.0f * yy)) +
+        sh13 * (SH_C3_4 * x * (4.0f * zz - xx - yy)) +
+        sh14 * (SH_C3_5 * z * (xx - yy)) +
+        sh15 * (SH_C3_6 * x * (xx - 3.0f * yy));
+    }
+  }
+
+  return result;
+}
+
+float3 apply_color_controls(float3 color)
+{
+  color *= color_tint;
+  color = (color - 0.5f) * contrast + 0.5f;
+  color += brightness;
+  return max(color, 0.0f);
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, 1, 1)] void main(
+    uint3 group_id : SV_GroupID,
+    uint group_index : SV_GroupIndex) {
+  // Dispatch may be wrapped onto Y/Z for large splat counts.
+  uint local_id =
+      GetUnWrappedDispatchThreadId(group_id, group_index, THREAD_GROUP_SIZE_X);
+  if (local_id >= num_splats) {
+    return;
+  }
+
+#if SAMPLE_SPLATS
+  // Divide the source into contiguous intervals and select each midpoint. This
+  // is stable across frames and eyes, covers the whole source, and avoids
+  // clustered prefix sampling without integer multiplication overflow.
+  uint source_id = local_id;
+  uint base_interval = source_num_splats / num_splats;
+  uint longer_interval_count = source_num_splats - base_interval * num_splats;
+  uint interval_start = local_id * base_interval + min(local_id, longer_interval_count);
+  uint interval_length = base_interval + (local_id < longer_interval_count ? 1u : 0u);
+  source_id = interval_start + interval_length / 2u;
+#define SOURCE_SPLAT_ID source_id
+#else
+#define SOURCE_SPLAT_ID local_id
+#endif
+
+  uint global_id = global_offset + local_id;
+  float4 pos_local = bUseFloatPositions != 0u
+                         ? positions_float[SOURCE_SPLAT_ID]
+                         : unpack_pos(positions[SOURCE_SPLAT_ID], pos_scale_cm, pos_min_cm);
+  float4 pos_world = mul(pos_local, local_to_world);
+  float3 pos_view = mul(pos_local, local_to_view).xyz;
+  float4 pos_clip = mul(pos_local, local_to_clip);
+
+  bool inside_frustum = pos_view.z > 0.0f &&
+                        pos_clip.w > 1e-6f &&
+                        pos_clip.x >= -pos_clip.w && pos_clip.x <= pos_clip.w &&
+                        pos_clip.y >= -pos_clip.w && pos_clip.y <= pos_clip.w;
+#if COMPACT_DRAW
+  // Match the remaining clip-depth checks in RenderGlobalSplatVS. Keep the
+  // non-compact permutation byte-for-byte compatible with the old gather.
+  inside_frustum = inside_frustum &&
+                   pos_clip.z >= 0.0f && pos_clip.z <= pos_clip.w;
+#endif
+
+  if (!inside_frustum)
+  {
+    out_global_indices[global_id] = global_id;
+    out_global_distances[global_id] = sort_depth_not_visible;
+    #if WRITE_WORLD_CENTERS
+    out_global_world_centers[global_id] = pos_world;
+    #endif
+    out_global_transforms[global_id] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    out_global_colors[global_id] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    return;
+  }
+
+  float effective_z = max(pos_view.z, SPLAT_SORT_NEAR_CLIP_CM);
+
+  // Preserve every original depth key, including alpha-culled points. This
+  // keeps the baseline ordering/tie behavior while skipping covariance/SH.
+  float normalized_depth = saturate(SPLAT_SORT_NEAR_CLIP_CM / effective_z);
+  uint depth_key = uint(normalized_depth * sort_depth_scale);
+  out_global_indices[global_id] = global_id;
+  out_global_distances[global_id] = depth_key;
+  #if WRITE_WORLD_CENTERS
+  out_global_world_centers[global_id] = pos_world;
+  #endif
+  float4 c = colors[SOURCE_SPLAT_ID];
+  float active_alpha = c.a * opacity;
+#if COMPACT_DRAW
+  bool compact_alpha_culled = compact_eye_index >= 2u ||
+                              splat_should_cull_active_alpha(
+                                  active_alpha, active_alpha_threshold);
+#else
+  bool compact_alpha_culled = false;
+#endif
+  bool early_alpha_culled = early_alpha_cull != 0u &&
+                            splat_should_cull_active_alpha(
+                                active_alpha, active_alpha_threshold);
+  if (compact_alpha_culled || early_alpha_culled)
+  {
+#if COMPACT_DRAW
+    if (compact_alpha_culled)
+    {
+      out_global_distances[global_id] = sort_depth_not_visible;
+    }
+#endif
+    out_global_transforms[global_id] = 0.0f;
+    // Keep the exact alpha so the unchanged VS also rejects negative cutoffs.
+    out_global_colors[global_id] = float4(0.0f, 0.0f, 0.0f, active_alpha);
+    return;
+  }
+
+  // Recompute 2x2 transform directly from covariances with stabilization.
+  float3x3 sig = load_cov_mat(SOURCE_SPLAT_ID);
+  float3x3 W = float3x3(local_to_view[0].xyz, local_to_view[1].xyz, local_to_view[2].xyz);
+  float scale_x = -pos_view.x / effective_z;
+  float scale_y = -pos_view.y / effective_z;
+  float3 jw_0 = float3(W[0][0] + scale_x * W[0][2], W[1][0] + scale_x * W[1][2], W[2][0] + scale_x * W[2][2]);
+  float3 jw_1 = float3(W[0][1] + scale_y * W[0][2], W[1][1] + scale_y * W[1][2], W[2][1] + scale_y * W[2][2]);
+  float3 jw_sig_0 = mul(jw_0, sig);
+  float3 jw_sig_1 = mul(jw_1, sig);
+  float sig_p_00 = mul(jw_sig_0, jw_0);
+  float sig_p_01 = mul(jw_sig_0, jw_1);
+  float sig_p_11 = mul(jw_sig_1, jw_1);
+
+  // Convert to screen-space (pixels²) first, then add bias and clamp eigenvalues.
+  float focal_over_z = two_focal_length / effective_z;
+  float foz_sq = focal_over_z * focal_over_z;
+  float cov_00 = foz_sq * sig_p_00 + PROJECTED_COVARIANCE_DIAGONAL_BIAS;
+  float cov_01 = foz_sq * sig_p_01;
+  float cov_11 = foz_sq * sig_p_11 + PROJECTED_COVARIANCE_DIAGONAL_BIAS;
+
+  float det = cov_00 * cov_11 - cov_01 * cov_01;
+  float trace = cov_00 + cov_11;
+  float sqrt_disc = sqrt(max(trace * trace - 4.0f * det, 0.0f));
+  float2 two_lmb = float2(trace + sqrt_disc, trace - sqrt_disc);
+  two_lmb = max(two_lmb, float2(PROJECTED_COVARIANCE_MIN_EIGENVALUE, PROJECTED_COVARIANCE_MIN_EIGENVALUE));
+  float2 sqrt_two_sigma = sqrt(two_lmb);
+  float2 v_0_raw = float2(cov_01, two_lmb.x / 2.0f - cov_00);
+  float v_len_sq = dot(v_0_raw, v_0_raw);
+  float2 v_0 = (v_len_sq > 1e-12f) ? v_0_raw * rsqrt(v_len_sq) : float2(1.0f, 0.0f);
+
+  // sqrt_two_sigma is already in pixels; no focal_over_z multiplication.
+  float2 projected_scale = sqrt_two_sigma * debug_scale_factor;
+
+  float4 transform;
+  if (any(isnan(projected_scale)) || any(isinf(projected_scale)))
+  {
+    transform = float4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  else
+  {
+    float max_axis_pixels = min(max_projected_axis_pixels, PROJECTED_SPLAT_MAX_AXIS_PIXELS);
+    projected_scale = min(projected_scale, float2(max_axis_pixels, max_axis_pixels));
+    transform = float4(v_0.x, -v_0.y, v_0.y, v_0.x) * projected_scale.xyxy;
+  }
+
+  out_global_transforms[global_id] = transform;
+
+#if COMPACT_DRAW
+  {
+    float4 draw_transform = transform *
+        splat_alpha_radius_scale(active_alpha, alpha_scale_threshold);
+    float max_axis_sq = max(
+        dot(draw_transform.xz, draw_transform.xz),
+        dot(draw_transform.yw, draw_transform.yw));
+    if (max_axis_sq < min_projected_axis_pixels_squared)
+    {
+      out_global_distances[global_id] = sort_depth_not_visible;
+      out_global_transforms[global_id] = 0.0f;
+      out_global_colors[global_id] = float4(0.0f, 0.0f, 0.0f, active_alpha);
+      return;
+    }
+  }
+#endif
+
+  // Evaluate SH in source basis and add to display-space DC color.
+  if (sh_degree > 0u && sh_num_triplets > 0u)
+  {
+    float3x3 local_to_world_3x3 = (float3x3)local_to_world;
+    local_to_world_3x3[0] = normalize(local_to_world_3x3[0]);
+    local_to_world_3x3[1] = normalize(local_to_world_3x3[1]);
+    local_to_world_3x3[2] = normalize(local_to_world_3x3[2]);
+    float3x3 world_to_local_3x3 = transpose(local_to_world_3x3);
+    float3 view_delta_world = pos_world.xyz - world_camera_origin;
+    float3 view_dir_ue_local = mul(view_delta_world, world_to_local_3x3);
+    float3 view_dir_src = float3(
+      view_dir_ue_local.y,
+      -view_dir_ue_local.z,
+      view_dir_ue_local.x);
+    view_dir_src *= rsqrt(max(dot(view_dir_src, view_dir_src), 1e-8f));
+    c.rgb = max(c.rgb + eval_sh(SOURCE_SPLAT_ID, view_dir_src), 0.0f);
+  }
+  c.rgb = apply_color_controls(c.rgb);
+  // Gamma to UE linear pipeline after DC+SH blending in display space.
+  c.rgb = pow(max(c.rgb, 0.0f), 2.2f);
+  c.a *= opacity;
+  out_global_colors[global_id] = c;
+}
+
+#undef SOURCE_SPLAT_ID

@@ -1,0 +1,49 @@
+/*
+  Copyright (c) 2026 Easytime Technology Co., Ltd. See LICENSE.md.
+*/
+
+#include "/Engine/Private/Common.ush"
+
+Buffer<uint> EasytimeValidCount;
+uint EasytimeRadixShift;
+RWBuffer<uint> EasytimeDispatchArgs;
+
+struct FEasytimeDynamicRadixSortParameters
+{
+    uint RadixShift;
+    uint TilesPerGroup;
+    uint ExtraTileCount;
+    uint ExtraKeyCount;
+    uint GroupCount;
+};
+
+FEasytimeDynamicRadixSortParameters EasytimeGetRadixSortParameters()
+{
+    const uint key_count = EasytimeValidCount[0];
+    const uint tile_size = THREAD_COUNT * KEYS_PER_LOOP;
+    const uint tile_count = key_count / tile_size;
+    const uint group_count = clamp(tile_count, 1u, MAX_GROUP_COUNT);
+
+    FEasytimeDynamicRadixSortParameters parameters;
+    parameters.RadixShift = EasytimeRadixShift;
+    parameters.TilesPerGroup = tile_count / group_count;
+    parameters.ExtraTileCount = tile_count % group_count;
+    parameters.ExtraKeyCount = key_count % tile_size;
+    parameters.GroupCount = group_count;
+    return parameters;
+}
+
+[numthreads(1, 1, 1)]
+void BuildDynamicRadixSortArgsCS()
+{
+    const FEasytimeDynamicRadixSortParameters parameters =
+        EasytimeGetRadixSortParameters();
+    EasytimeDispatchArgs[0] = parameters.GroupCount;
+    EasytimeDispatchArgs[1] = 1u;
+    EasytimeDispatchArgs[2] = 1u;
+}
+
+// Reuse Unreal's proven stable radix kernels while sourcing their work range
+// from the exact GPU count produced by splat compaction.
+#define RadixSortUB EasytimeGetRadixSortParameters()
+#include "/Engine/Private/RadixSortShaders.usf"
